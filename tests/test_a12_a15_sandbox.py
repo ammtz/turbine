@@ -29,13 +29,19 @@ class TestA12Timeout(unittest.TestCase):
                 "pid = os.fork()",
                 "if pid == 0:",
                 "    time.sleep(10**6)",
-                "open('childpid','w',encoding='utf-8').write(str(pid))",
+                "f = open('childpid','w',encoding='utf-8')",
+                "f.write(str(pid))",
+                "f.flush()",
+                "os.fsync(f.fileno())",
+                "f.close()",
                 "while True:",
                 "    pass",
             ]
         )
         t0 = time.monotonic()
-        result = run_candidate(code, timeout=1.0)
+        result = run_candidate(
+            code, timeout=1.0, memory_bytes=1024 * 1024 * 1024, network_check=lambda: False
+        )
         elapsed = time.monotonic() - t0
         self.assertEqual(result.score, 0.0)
         self.assertIn("timeout", result.feedback.lower())
