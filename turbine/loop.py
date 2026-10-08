@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
 
 from turbine.governor import ACCEPT, CONTINUE, DONE, HALT, PARK, Governor
-from turbine.ledger import MemoryLedger
+from turbine.ledger import Ledger
 from turbine.trail import trim_trail
 from turbine.types import Handoff, HistoryEntry
 
@@ -43,7 +43,7 @@ def run(
     worker_factory: WorkerFactory,
     initial_state: Any,
     governor: Governor,
-    ledger: MemoryLedger,
+    ledger: Ledger,
     context_level: float,
     max_attempts: int,
 ) -> Result:
@@ -86,7 +86,13 @@ def run(
             )
             visible = trim_trail(trail, context_level)
             state, tokens, note = worker.step(handoff, visible)
-            ledger.settle(reserved, tokens)
+            ledger.settle(
+                reserved,
+                tokens,
+                source="worker",
+                output=tokens,
+                note=note,
+            )
             total_tokens += tokens
 
             score, feedback = scorer(state)
