@@ -146,7 +146,8 @@ Each milestone is its own PR into the Turbine repo, with its tests. Never merge 
 - If a requirement is unclear or two requirements conflict, stop and write the question at the top of the PR. Don't guess.
 - Keep each PR under about 400 changed lines. Split if bigger.
 
-## 10. Open decisions (owner)
-- Where it lives: its own repo, or a folder in the current one.
-- Licence.
-- Which worker backend the builder should assume first: `claude -p` or an OpenAI-compatible endpoint.
+## 10. Owner decisions
+- Where it lives: its own repo, github.com/ammtz/turbine. (decided 2026-10-08)
+- Licence: MIT. (decided 2026-10-08)
+- First worker backend: headless `claude -p` (adapter (a) in 6.7). The OpenAI-compatible HTTP adapter still ships in M6 as the second backend. (decided 2026-10-08)
+

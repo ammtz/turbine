@@ -11,3 +11,6 @@ python -m unittest discover -s tests -v
 ```
 
 Requires Python 3.11+. Standard library only.
+
+License: MIT
+
