@@ -43,6 +43,12 @@ class TestA1TruthTable(unittest.TestCase):
         self.assertEqual(self.g.decide(H(0.70), self.out), ACCEPT)
         self.assertEqual(self.g.decide(H(0.85), self.out), ACCEPT)
 
+    def test_exhausted_beats_stall_below_bar(self) -> None:
+        # Budget precedence over stall/max_rounds (SPEC §4): both true, best < bar → HALT.
+        stalled_below = H(0.40, 0.40, 0.40, 0.40)
+        self.assertEqual(self.g.decide(stalled_below, self.ok), PARK)
+        self.assertEqual(self.g.decide(stalled_below, self.out), HALT)
+
     def test_continue_and_eps_boundary(self) -> None:
         self.assertEqual(self.g.decide(H(0.50, 0.50, 0.50, 0.52), self.ok), CONTINUE)
         self.assertEqual(self.g.decide(H(0.50, 0.50, 0.50, 0.51), self.ok), CONTINUE)
@@ -57,7 +63,6 @@ class TestA1TruthTable(unittest.TestCase):
 class TestA2StallWindow(unittest.TestCase):
     def test_exactly_window_is_continue(self) -> None:
         g, ok = gov(), LedgerView(exhausted=False)
-        self.assertEqual(len(H(0.40, 0.40, 0.40)), 3)
         self.assertEqual(g.decide(H(0.40, 0.40, 0.40), ok), CONTINUE)
         self.assertEqual(g.decide(H(0.40, 0.40, 0.40, 0.40), ok), PARK)
 

@@ -9,7 +9,7 @@ from turbine.governor import ACCEPT, DONE, HALT, PARK, make_governor
 from turbine.ledger import MemoryLedger
 from turbine.loop import run
 from turbine.trail import trim_trail
-from turbine.types import Handoff, HistoryEntry, LedgerView
+from turbine.types import Handoff
 
 
 class DoneForeverWorker:
@@ -76,32 +76,26 @@ class TestA4GovernorEndsRun(unittest.TestCase):
             workers.append(w)
             return w
 
-        g = base_gov()
+        # Flat 0.50 < bar=0.80, window=3 → stall→park per attempt; max_attempts=2 → PARK.
         result = run(
             task="synthetic-task",
             scorer=const_scorer(0.50, "flat"),
             worker_factory=factory,
             initial_state="start",
-            governor=g,
+            governor=base_gov(ideal=0.99, bar=0.80, eps=0.01, window=3, max_rounds=20),
             ledger=MemoryLedger(max_tokens=1_000_000, max_step_tokens=10),
             context_level=1.0,
             max_attempts=2,
         )
-        self.assertIn(result.exit, {PARK, ACCEPT})
-        self.assertNotEqual(result.exit, DONE)
+        self.assertEqual(result.exit, PARK)
+        self.assertEqual(result.attempts, 2)
+        self.assertEqual(len(workers), 2)
+        self.assertEqual(workers[0].steps, 4)
+        self.assertEqual(workers[1].steps, 4)
         notes = [n for w in workers for n in w.notes]
-        self.assertGreater(len(notes), 0)
-        for i in range(min(len(notes), 64)):
+        self.assertEqual(len(notes), 8)
+        for i in range(len(notes)):
             self.assertEqual(notes[i], "I am done")
-        self.assertGreaterEqual(workers[0].steps, 4)
-        expected = g.decide(
-            [HistoryEntry(score=0.50) for _ in range(workers[0].steps)],
-            LedgerView(exhausted=False),
-        )
-        if result.attempts == 1:
-            self.assertEqual(result.exit, expected)
-        else:
-            self.assertEqual(result.exit, PARK)
 
 
 class TestA5ContextLevelTrail(unittest.TestCase):
@@ -172,7 +166,7 @@ class TestA6ParkFreshEyes(unittest.TestCase):
         self.assertEqual(hand.best_state, "state-1")
         self.assertEqual(hand.score_history, [0.40] * len(first.trails))
         self.assertEqual(hand.last_feedback, f"lastfb:state-{len(first.trails)}")
-        self.assertIn(result.exit, {PARK, ACCEPT, HALT, DONE})
+        self.assertEqual(result.exit, PARK)
 
 
 class TestA7ExitSet(unittest.TestCase):
