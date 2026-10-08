@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from typing import Any
@@ -27,16 +28,15 @@ class FakeClock:
 
 
 class TokenWorker:
-    def __init__(self, cost: int = 1_000) -> None:
+    """Costs `cost` tokens; brief pause so many reservations overlap (A8)."""
+
+    def __init__(self, cost: int = 1_000, pause_s: float = 0.005) -> None:
         self.cost = cost
+        self.pause_s = pause_s
 
     def step(self, handoff: Any, trail: list[str]) -> tuple[str, int, str]:
+        time.sleep(self.pause_s)
         return ("state", self.cost, "step")
-
-
-class OverrunWorker:
-    def step(self, handoff: Any, trail: list[str]) -> tuple[str, int, str]:
-        return ("state", 2_000, "overrun")
 
 
 def _flat_run(ledger: Ledger, factory) -> Any:
@@ -84,7 +84,7 @@ class TestA8SharedLedgerThreads(unittest.TestCase):
         lock = threading.Lock()
 
         def target() -> None:
-            r = _flat_run(ledger, lambda: TokenWorker(step))
+            r = _flat_run(ledger, lambda: TokenWorker(step, pause_s=0.005))
             with lock:
                 results.append(r)
 
@@ -92,12 +92,13 @@ class TestA8SharedLedgerThreads(unittest.TestCase):
         for t in threads:
             t.start()
         for i in range(8):
-            threads[i].join(timeout=5.0)
+            threads[i].join(timeout=10.0)
             self.assertFalse(threads[i].is_alive(), f"thread {i} alive")
 
         rounds = sum(r.rounds for r in results)
         self.assertEqual(ledger.charged, rounds * step)
         self.assertEqual(ledger.charged, max_tokens)
+        self.assertLessEqual(ledger.charged, max_tokens)
         rows = _rows(path)
         self.assertEqual(len(rows), rounds)
         self.assertEqual(sum(_charged(r) for r in rows), ledger.charged)
@@ -106,35 +107,70 @@ class TestA8SharedLedgerThreads(unittest.TestCase):
 
 
 class TestA9OverrunExhausts(unittest.TestCase):
-    def test_overrun_exhausts_and_stops_within_one_round(self) -> None:
+    def test_one_overrun_stops_every_run(self) -> None:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        ledger = Ledger(
+        path = Path(tmp.name) / "spend.jsonl"
+        overrun_settled = threading.Event()
+        barrier = threading.Barrier(4, timeout=5.0)
+
+        class SignalingLedger(Ledger):
+            def settle(self, reserved: int, actual: int, **kwargs: Any) -> None:
+                super().settle(reserved, actual, **kwargs)
+                if self.overruns >= 1:
+                    overrun_settled.set()
+
+        ledger = SignalingLedger(
             max_tokens=100_000,
             max_step_tokens=1_000,
-            path=str(Path(tmp.name) / "spend.jsonl"),
+            path=str(path),
         )
-        results: list[Any] = []
+
+        class SyncOverrunWorker:
+            def step(self, handoff: Any, trail: list[str]) -> tuple[str, int, str]:
+                barrier.wait()
+                return ("state", 2_000, "overrun")
+
+        class SyncTokenWorker:
+            def step(self, handoff: Any, trail: list[str]) -> tuple[str, int, str]:
+                barrier.wait()
+                if not overrun_settled.wait(timeout=5.0):
+                    raise TimeoutError("overrun settle event timed out")
+                return ("state", 1_000, "step")
+
+        overrun_result: list[Any] = []
+        token_results: list[Any] = []
         lock = threading.Lock()
 
-        def target() -> None:
-            r = _flat_run(ledger, OverrunWorker)
+        def overrun_target() -> None:
+            r = _flat_run(ledger, SyncOverrunWorker)
             with lock:
-                results.append(r)
+                overrun_result.append(r)
 
-        threads = [threading.Thread(target=target) for _ in range(4)]
+        def token_target() -> None:
+            r = _flat_run(ledger, SyncTokenWorker)
+            with lock:
+                token_results.append(r)
+
+        threads = [threading.Thread(target=overrun_target)]
+        threads.extend(threading.Thread(target=token_target) for _ in range(3))
         for t in threads:
             t.start()
-        for i in range(4):
-            threads[i].join(timeout=5.0)
+        for i in range(len(threads)):
+            threads[i].join(timeout=10.0)
             self.assertFalse(threads[i].is_alive(), f"thread {i} alive")
 
+        self.assertTrue(overrun_settled.is_set())
         self.assertTrue(ledger.exhausted)
-        self.assertGreaterEqual(ledger.overruns, 1)
-        self.assertEqual(len(results), 4)
-        for i in range(4):
-            self.assertLessEqual(results[i].rounds, 1)
-            self.assertEqual(results[i].exit, HALT)
+        self.assertEqual(ledger.overruns, 1)
+        self.assertEqual(len(overrun_result), 1)
+        self.assertEqual(len(token_results), 3)
+        self.assertEqual(overrun_result[0].exit, HALT)
+        self.assertEqual(overrun_result[0].rounds, 1)
+        for i in range(3):
+            # At most one more round after the flip (held reserve completes).
+            self.assertLessEqual(token_results[i].rounds, 1)
+            self.assertEqual(token_results[i].exit, HALT)
 
 
 class TestA10PauseResumeTime(unittest.TestCase):
@@ -166,7 +202,7 @@ class TestA10PauseResumeTime(unittest.TestCase):
 
 
 class TestA11JsonlAndMonitor(unittest.TestCase):
-    def test_jsonl_sums_and_cache_reads_not_charged(self) -> None:
+    def test_jsonl_sums_and_exact_monitor_flags(self) -> None:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         path = Path(tmp.name) / "spend.jsonl"
@@ -186,27 +222,41 @@ class TestA11JsonlAndMonitor(unittest.TestCase):
         self.assertEqual(ledger.charged, 75)
         self.assertEqual(sum(int(r["cache_read"]) for r in rows), 60)
         self.assertEqual(ledger.cache_read_total, 60)
-        report = monitor.format_report(ledger)
-        self.assertIn("75", report)
-        self.assertIn("cache_read", report)
-        self.assertIn("60", report)
-        self.assertNotIn("WARN", report)
+        self.assertEqual(
+            monitor.format_report(ledger),
+            "spend 75/1000 (7.5%) cache_read 60",
+        )
 
-        wpath = Path(tmp.name) / "w.jsonl"
-        w = Ledger(max_tokens=100, max_step_tokens=80, path=str(wpath))
-        self.assertIsNotNone(w.reserve(80))
-        w.settle(80, 80, input=40, output=40, cache_write=0, cache_read=99)
-        self.assertIn("WARN", monitor.format_report(w))
-        self.assertEqual(w.cache_read_total, 99)
+        # 79% is not WARN.
+        p79 = Path(tmp.name) / "p79.jsonl"
+        mid = Ledger(max_tokens=100, max_step_tokens=79, path=str(p79))
+        self.assertIsNotNone(mid.reserve(79))
+        mid.settle(79, 79, input=39, output=40, cache_write=0, cache_read=3)
+        self.assertEqual(
+            monitor.format_report(mid),
+            "spend 79/100 (79.0%) cache_read 3",
+        )
 
-        hpath = Path(tmp.name) / "h.jsonl"
-        h = Ledger(max_tokens=50, max_step_tokens=50, path=str(hpath))
-        self.assertIsNotNone(h.reserve(50))
-        h.settle(50, 50, input=25, output=25, cache_write=0, cache_read=7)
-        halt = monitor.format_report(h)
-        self.assertIn("HALT", halt)
-        self.assertIn("7", halt)
-        self.assertEqual(h.charged, 50)
+        # Exact 80% → WARN.
+        p80 = Path(tmp.name) / "p80.jsonl"
+        warn = Ledger(max_tokens=100, max_step_tokens=80, path=str(p80))
+        self.assertIsNotNone(warn.reserve(80))
+        warn.settle(80, 80, input=40, output=40, cache_write=0, cache_read=99)
+        self.assertEqual(
+            monitor.format_report(warn),
+            "spend 80/100 (80.0%) cache_read 99 WARN",
+        )
+
+        # 100% → HALT.
+        p100 = Path(tmp.name) / "p100.jsonl"
+        halt = Ledger(max_tokens=50, max_step_tokens=50, path=str(p100))
+        self.assertIsNotNone(halt.reserve(50))
+        halt.settle(50, 50, input=25, output=25, cache_write=0, cache_read=7)
+        self.assertEqual(
+            monitor.format_report(halt),
+            "spend 50/50 (100.0%) cache_read 7 HALT",
+        )
+        self.assertEqual(halt.charged, 50)
 
 
 if __name__ == "__main__":

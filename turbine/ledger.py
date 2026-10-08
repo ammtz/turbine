@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import tempfile
 import threading
 import time
 from pathlib import Path
@@ -11,6 +10,8 @@ from typing import Callable
 
 
 Clock = Callable[[], float]
+
+DEFAULT_SPEND_PATH = "turbine-spend.jsonl"
 
 
 class Ledger:
@@ -39,13 +40,7 @@ class Ledger:
         self._pause_started: float | None = None
         self._paused_total = 0.0
         self._started = self._clock()
-        if path is None:
-            tmp = tempfile.NamedTemporaryFile(
-                prefix="turbine-spend-", suffix=".jsonl", delete=False
-            )
-            tmp.close()
-            path = tmp.name
-        self.path = str(path)
+        self.path = str(path if path is not None else DEFAULT_SPEND_PATH)
         self.budget_path = str(Path(self.path).with_suffix(".budget.json"))
         self._write_budget()
 

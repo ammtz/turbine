@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 from typing import Any
 
 from turbine.governor import ACCEPT, DONE, HALT, PARK, make_governor
@@ -10,6 +12,14 @@ from turbine.ledger import MemoryLedger
 from turbine.loop import run
 from turbine.trail import trim_trail
 from turbine.types import Handoff
+
+
+def _ledger(test: unittest.TestCase, **kw: Any) -> MemoryLedger:
+    """Per-test spend path so the cwd default JSONL is not shared."""
+    tmp = tempfile.TemporaryDirectory()
+    test.addCleanup(tmp.cleanup)
+    path = str(Path(tmp.name) / "spend.jsonl")
+    return MemoryLedger(max_tokens=1_000_000, max_step_tokens=10, path=path, **kw)
 
 
 class DoneForeverWorker:
@@ -83,7 +93,7 @@ class TestA4GovernorEndsRun(unittest.TestCase):
             worker_factory=factory,
             initial_state="start",
             governor=base_gov(ideal=0.99, bar=0.80, eps=0.01, window=3, max_rounds=20),
-            ledger=MemoryLedger(max_tokens=1_000_000, max_step_tokens=10),
+            ledger=_ledger(self),
             context_level=1.0,
             max_attempts=2,
         )
@@ -110,7 +120,7 @@ class TestA5ContextLevelTrail(unittest.TestCase):
             worker_factory=RecordingWorker,
             initial_state="start",
             governor=base_gov(**gkw),
-            ledger=MemoryLedger(max_tokens=1_000_000, max_step_tokens=10),
+            ledger=_ledger(self),
             context_level=level,
             max_attempts=1,
         )
@@ -154,7 +164,7 @@ class TestA6ParkFreshEyes(unittest.TestCase):
             worker_factory=RecordingWorker,
             initial_state="seed-state",
             governor=base_gov(bar=0.80),
-            ledger=MemoryLedger(max_tokens=1_000_000, max_step_tokens=10),
+            ledger=_ledger(self),
             context_level=1.0,
             max_attempts=2,
         )
@@ -182,7 +192,7 @@ class TestA7ExitSet(unittest.TestCase):
         for i in range(len(cases)):
             score, ideal, bar, exhausted, want = cases[i]
             with self.subTest(i=i, want=want):
-                ledger = MemoryLedger(max_tokens=1_000_000, max_step_tokens=10)
+                ledger = _ledger(self)
                 if exhausted:
                     ledger.mark_exhausted()
                 result = run(
