@@ -37,6 +37,7 @@ MS_REC = 16384
 MS_PRIVATE = 1 << 18
 PR_SET_DUMPABLE = 4
 PR_GET_DUMPABLE = 3
+PR_SET_CHILD_SUBREAPER = 36
 
 _HARNESS = textwrap.dedent(
     r"""
@@ -141,11 +142,11 @@ def _is_under(path: str, root: str) -> bool:
 
 
 def _workdir_root(host_tmpdir: str) -> str:
-    for candidate in ("/var/tmp", "/workspace", str(Path.cwd())):
+    for candidate in ("/var/tmp", str(Path.cwd())):
         try:
-            Path(candidate).mkdir(parents=True, exist_ok=True)
-            if os.access(candidate, os.W_OK) and not _is_under(candidate, host_tmpdir):
-                return candidate
+            if os.path.isdir(candidate) and os.access(candidate, os.W_OK):
+                if not _is_under(candidate, host_tmpdir):
+                    return candidate
         except Exception:
             continue
     return "/var/tmp"
@@ -191,6 +192,13 @@ def _prctl_dumpable(value: int) -> int | None:
         return int(prev)
     except Exception:
         return None
+
+
+def _prctl_child_subreaper(value: int) -> bool:
+    try:
+        return _libc().prctl(PR_SET_CHILD_SUBREAPER, value, 0, 0, 0) == 0
+    except Exception:
+        return False
 
 
 def _collect_descendants(root_pid: int, limit: int = 256) -> list[int]:
@@ -398,7 +406,6 @@ def run_candidate(
     net_flag = False
     fs_flag = False
     detail = ""
-    prev_dumpable: int | None = None
 
     try:
         script.write_text(_HARNESS + "\n" + code + "\n", encoding="utf-8")
@@ -481,15 +488,15 @@ def run_candidate(
                 os._exit(127)
             if pid1 != 0:
                 os.close(hold_r)
-                if got_net or attempt:
-                    # Remount only when isolation was attempted and maps succeeded.
-                    if child_detail == "ok" and got_net:
-                        mounter = mount_fn or _mount_tmpfs
-                        got_fs = bool(mounter(host_tmpdir))
-                    elif mount_fn is not None and child_detail == "ok":
-                        # Stubbed path: unshare was a no-op; still honour mount_fn.
-                        got_fs = bool(mount_fn(host_tmpdir))
-                        got_net = True
+                # Candidate's ppid is this intermediate process; scrub dumpable
+                # before it can read /proc/<ppid>/environ.
+                _prctl_dumpable(0)
+                # Orphans of the candidate reparent here instead of init, so we
+                # can reap them without killing recycled host PIDs.
+                _prctl_child_subreaper(1)
+                if child_detail == "ok" and got_net:
+                    mounter = mount_fn or _mount_tmpfs
+                    got_fs = bool(mounter(host_tmpdir))
                 try:
                     os.write(
                         flag_w,
@@ -510,6 +517,27 @@ def run_candidate(
                     _, st = os.waitpid(pid1, 0)
                 except Exception:
                     os._exit(1)
+                # Reap any children reparented to us as subreaper.
+                for _ in range(32):
+                    orphans = _collect_descendants(os.getpid(), limit=256)
+                    if not orphans:
+                        try:
+                            wpid, _ = os.waitpid(-1, os.WNOHANG)
+                        except ChildProcessError:
+                            break
+                        if wpid == 0:
+                            break
+                        continue
+                    for dpid in orphans:
+                        try:
+                            os.kill(dpid, signal.SIGKILL)
+                        except Exception:
+                            pass
+                    try:
+                        os.waitpid(-1, os.WNOHANG)
+                    except ChildProcessError:
+                        break
+                    time.sleep(0.02)
                 if os.WIFEXITED(st):
                     os._exit(os.WEXITSTATUS(st))
                 if os.WIFSIGNALED(st):
@@ -546,7 +574,9 @@ def run_candidate(
                     pass
                 os._exit(127)
 
-        # Parent
+        # Parent: become subreaper so orphans of a killed intermediate reparent
+        # here and can be reaped by current children, not by stale PIDs.
+        _prctl_child_subreaper(1)
         os.close(ready_w)
         os.close(go_r)
         os.close(flag_w)
@@ -554,23 +584,18 @@ def run_candidate(
         try:
             if attempt:
                 ready = os.read(ready_r, 1)
-                # uid_map writes require the parent to remain dumpable; set
-                # PR_SET_DUMPABLE=0 only after maps succeed so the candidate
-                # cannot read /proc/<ppid>/environ.
+                # uid_map writes require this process to remain dumpable.
+                # Environ scrub for the candidate is done in the intermediate
+                # (pid1 != 0) before the candidate runs.
                 mapped = ready == b"1" and maps(pid, os.getuid(), os.getgid())
-                prev_dumpable = _prctl_dumpable(0)
                 if mapped:
                     os.write(go_w, b"1")
                 else:
                     os.write(go_w, b"0")
                     if ready == b"1":
                         detail = "uid_map_failed"
-            else:
-                prev_dumpable = _prctl_dumpable(0)
         except Exception as exc:
             detail = f"parent:{exc}"
-            if prev_dumpable is None:
-                prev_dumpable = _prctl_dumpable(0)
             try:
                 os.write(go_w, b"0")
             except Exception:
@@ -602,13 +627,8 @@ def run_candidate(
         timed_out = False
         exited = False
         status = 0
-        known_descendants: set[int] = set()
         deadline = time.monotonic() + timeout
         while True:
-            # Track descendants while the sandbox leader is still alive so we
-            # can kill them after reparenting (no PID namespace case).
-            for dpid in _collect_descendants(pid, limit=256):
-                known_descendants.add(dpid)
             try:
                 waited, status = os.waitpid(pid, os.WNOHANG)
             except ChildProcessError:
@@ -623,13 +643,33 @@ def run_candidate(
                 break
             time.sleep(0.02)
 
-        # Always kill the group and any remembered descendants.
+        # Kill the sandbox leader/group; subreaper then lets us reap orphans
+        # that were live children of this process (no stale-PID kill list).
         _reap_tree(pid)
-        for dpid in list(known_descendants)[:256]:
+        for _ in range(32):
+            orphans = [
+                dpid
+                for dpid in _collect_descendants(os.getpid(), limit=256)
+                if dpid != pid
+            ]
+            if not orphans:
+                try:
+                    wpid, _ = os.waitpid(-1, os.WNOHANG)
+                except ChildProcessError:
+                    break
+                if wpid == 0:
+                    break
+                continue
+            for dpid in orphans:
+                try:
+                    os.kill(dpid, signal.SIGKILL)
+                except Exception:
+                    pass
             try:
-                os.kill(dpid, signal.SIGKILL)
-            except Exception:
-                pass
+                os.waitpid(-1, os.WNOHANG)
+            except ChildProcessError:
+                break
+            time.sleep(0.02)
         if not exited:
             try:
                 _, status = os.waitpid(pid, 0)
@@ -696,7 +736,5 @@ def run_candidate(
             isolation_detail=detail,
         )
     finally:
-        if prev_dumpable is not None:
-            _prctl_dumpable(prev_dumpable)
         if not keep_workdir:
             shutil.rmtree(workdir, ignore_errors=True)

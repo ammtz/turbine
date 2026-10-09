@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -138,36 +140,60 @@ class TestA13EnvAndWrites(unittest.TestCase):
             },
             clear=False,
         ):
+            self.assertEqual(os.environ.get("TURBINE_TEST_API_KEY"), "sk-test")
+            self.assertEqual(os.environ.get("OPENAI_API_KEY"), "sk-test-openai")
             result = run_candidate(code, timeout=2.0, isolation_check=lambda: False)
         self.assertNotIn("TURBINE_TEST_API_KEY", result.stdout)
         self.assertNotIn("OPENAI_API_KEY", result.stdout)
         self.assertNotIn("sk-test", result.stdout)
+        self.assertNotIn("sk-test", result.feedback)
 
     def test_parent_environ_not_readable_via_proc(self) -> None:
-        code = "\n".join(
+        # Secret must be in the real exec-time environ of the parent of
+        # run_candidate. mock.patch.dict only mutates os.environ and does not
+        # appear in /proc/<pid>/environ, so it cannot catch this leak.
+        secret = f"sk-parent-secret-{uuid.uuid4().hex}"
+        helper = "\n".join(
             [
-                "import os",
-                "ppid = os.getppid()",
-                "paths = [",
-                "    f'/proc/{ppid}/environ',",
-                "    f'/proc/self/../{ppid}/environ',",
-                "]",
-                "chunks = []",
-                "for p in paths:",
-                "    try:",
-                "        with open(p, 'rb') as f:",
-                "            chunks.append(f.read().decode('utf-8', 'replace'))",
-                "    except Exception as e:",
-                "        chunks.append(f'ERR:{type(e).__name__}')",
-                "print('---'.join(chunks))",
+                "import os, sys",
+                "from turbine.sandbox import run_candidate",
+                "code = chr(10).join([",
+                "    'import os',",
+                "    'ppid = os.getppid()',",
+                "    'paths = [',",
+                "    \"    f'/proc/{ppid}/environ',\",",
+                "    \"    f'/proc/self/../{ppid}/environ',\",",
+                "    ']',",
+                "    'chunks = []',",
+                "    'for p in paths:',",
+                "    '    try:',",
+                "    \"        with open(p, 'rb') as f:\",",
+                "    \"            chunks.append(f.read().decode('utf-8', 'replace'))\",",
+                "    '    except Exception as e:',",
+                "    \"        chunks.append(f'ERR:{type(e).__name__}')\",",
+                "    \"print('---'.join(chunks))\",",
+                "])",
+                "r = run_candidate(code, timeout=2.0, isolation_check=lambda: False)",
+                "sys.stdout.write(r.stdout)",
+                "sys.exit(0 if r.score == 1.0 else 1)",
             ]
         )
-        with mock.patch.dict(
-            os.environ, {"TURBINE_TEST_API_KEY": "sk-parent-secret"}, clear=False
-        ):
-            result = run_candidate(code, timeout=2.0, isolation_check=lambda: False)
-        self.assertNotIn("sk-parent-secret", result.stdout)
-        self.assertNotIn("TURBINE_TEST_API_KEY", result.stdout)
+        env = dict(os.environ)
+        env["TURBINE_TEST_API_KEY"] = secret
+        env["PYTHONPATH"] = os.pathsep.join(
+            [str(Path(__file__).resolve().parents[1])]
+            + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else [])
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", helper],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        self.assertNotIn(secret, proc.stdout)
+        self.assertNotIn("TURBINE_TEST_API_KEY", proc.stdout)
 
     def test_outside_writes_invisible_on_host(self) -> None:
         probe = run_candidate(
@@ -267,6 +293,8 @@ class TestA15FlagsAndPlumbing(unittest.TestCase):
             format_isolation_report(result),
             "network_isolation: false\nfilesystem_isolation: false",
         )
+        self.assertFalse(result.network_isolation)
+        self.assertFalse(result.filesystem_isolation)
 
     def test_report_false_when_unshare_fails_despite_check(self) -> None:
         def boom_unshare(flags: int) -> None:
@@ -349,6 +377,10 @@ class TestA15FlagsAndPlumbing(unittest.TestCase):
         )
         result = run_candidate(code, timeout=3.0, isolation_check=lambda: True)
         self.assertTrue(result.network_isolation)
+        self.assertEqual(
+            format_isolation_report(result).splitlines()[0],
+            "network_isolation: true",
+        )
         self.assertIn("BLOCKED", result.stdout)
         self.assertNotIn("CONNECTED", result.stdout)
 
