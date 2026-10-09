@@ -354,9 +354,12 @@ class TestA15FlagsAndPlumbing(unittest.TestCase):
 
     def test_workdir_survives_tmpdir_mask(self) -> None:
         fake_tmp = tempfile.mkdtemp(prefix="turbine-fake-tmp-")
-        self.addCleanup(
-            lambda: __import__("shutil").rmtree(fake_tmp, ignore_errors=True)
-        )
+
+        def _cleanup() -> None:
+            tempfile.tempdir = None
+            __import__("shutil").rmtree(fake_tmp, ignore_errors=True)
+
+        self.addCleanup(_cleanup)
         with mock.patch.dict(os.environ, {"TMPDIR": fake_tmp}, clear=False):
             # Force gettempdir to see TMPDIR.
             tempfile.tempdir = None
@@ -368,6 +371,7 @@ class TestA15FlagsAndPlumbing(unittest.TestCase):
                 write_maps_fn=lambda pid, uid, gid: True,
                 mount_fn=lambda target: True,
             )
+        tempfile.tempdir = None
         self.assertEqual(result.score, 1.0)
         self.assertIsNotNone(result.workdir)
         self.assertFalse(
