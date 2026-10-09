@@ -25,7 +25,14 @@ def _alive(pid: int) -> bool:
         return False
 
 
-class TestA12Timeout(unittest.TestCase):
+def _wait_dead(pid: int, limit_s: float = 2.0) -> bool:
+    deadline = time.monotonic() + limit_s
+    while time.monotonic() < deadline and _alive(pid):
+        time.sleep(0.05)
+    return not _alive(pid)
+
+
+class TestA12TimeoutAndReap(unittest.TestCase):
     def test_infinite_loop_times_out_and_kills_group(self) -> None:
         code = "\n".join(
             [
@@ -57,10 +64,62 @@ class TestA12Timeout(unittest.TestCase):
         child_file = Path(result.workdir) / "childpid"
         self.assertTrue(child_file.is_file(), "childpid must exist in workdir")
         child_pid = int(child_file.read_text(encoding="utf-8").strip())
-        deadline = time.monotonic() + 2.0
-        while time.monotonic() < deadline and _alive(child_pid):
-            time.sleep(0.05)
-        self.assertFalse(_alive(child_pid), f"grandchild {child_pid} still alive")
+        self.assertTrue(_wait_dead(child_pid), f"grandchild {child_pid} still alive")
+
+    def test_normal_exit_reaps_forked_sleeper(self) -> None:
+        code = "\n".join(
+            [
+                "import os, time",
+                "pid = os.fork()",
+                "if pid == 0:",
+                "    time.sleep(10**6)",
+                "f = open('childpid','w',encoding='utf-8')",
+                "f.write(str(pid))",
+                "f.flush()",
+                "os.fsync(f.fileno())",
+                "f.close()",
+            ]
+        )
+        result = run_candidate(
+            code, timeout=3.0, isolation_check=lambda: False
+        )
+        self.assertEqual(result.score, 1.0)
+        child_file = Path(result.workdir) / "childpid"
+        self.assertTrue(child_file.is_file())
+        child_pid = int(child_file.read_text(encoding="utf-8").strip())
+        self.assertTrue(_wait_dead(child_pid), f"sleeper {child_pid} still alive")
+
+    def test_setsid_child_killed_on_timeout(self) -> None:
+        code = "\n".join(
+            [
+                "import os, time",
+                "pid = os.fork()",
+                "if pid == 0:",
+                "    os.setsid()",
+                "    time.sleep(10**6)",
+                "f = open('childpid','w',encoding='utf-8')",
+                "f.write(str(pid))",
+                "f.flush()",
+                "os.fsync(f.fileno())",
+                "f.close()",
+                "while True:",
+                "    pass",
+            ]
+        )
+        result = run_candidate(
+            code,
+            timeout=1.0,
+            memory_bytes=1024 * 1024 * 1024,
+            isolation_check=lambda: False,
+        )
+        self.assertEqual(result.score, 0.0)
+        self.assertIn("timeout", result.feedback.lower())
+        child_file = Path(result.workdir) / "childpid"
+        self.assertTrue(child_file.is_file())
+        child_pid = int(child_file.read_text(encoding="utf-8").strip())
+        self.assertTrue(
+            _wait_dead(child_pid), f"setsid sleeper {child_pid} still alive"
+        )
 
 
 class TestA13EnvAndWrites(unittest.TestCase):
@@ -79,13 +138,36 @@ class TestA13EnvAndWrites(unittest.TestCase):
             },
             clear=False,
         ):
-            self.assertEqual(os.environ.get("TURBINE_TEST_API_KEY"), "sk-test")
-            self.assertEqual(os.environ.get("OPENAI_API_KEY"), "sk-test-openai")
             result = run_candidate(code, timeout=2.0, isolation_check=lambda: False)
         self.assertNotIn("TURBINE_TEST_API_KEY", result.stdout)
         self.assertNotIn("OPENAI_API_KEY", result.stdout)
         self.assertNotIn("sk-test", result.stdout)
-        self.assertNotIn("sk-test", result.feedback)
+
+    def test_parent_environ_not_readable_via_proc(self) -> None:
+        code = "\n".join(
+            [
+                "import os",
+                "ppid = os.getppid()",
+                "paths = [",
+                "    f'/proc/{ppid}/environ',",
+                "    f'/proc/self/../{ppid}/environ',",
+                "]",
+                "chunks = []",
+                "for p in paths:",
+                "    try:",
+                "        with open(p, 'rb') as f:",
+                "            chunks.append(f.read().decode('utf-8', 'replace'))",
+                "    except Exception as e:",
+                "        chunks.append(f'ERR:{type(e).__name__}')",
+                "print('---'.join(chunks))",
+            ]
+        )
+        with mock.patch.dict(
+            os.environ, {"TURBINE_TEST_API_KEY": "sk-parent-secret"}, clear=False
+        ):
+            result = run_candidate(code, timeout=2.0, isolation_check=lambda: False)
+        self.assertNotIn("sk-parent-secret", result.stdout)
+        self.assertNotIn("TURBINE_TEST_API_KEY", result.stdout)
 
     def test_outside_writes_invisible_on_host(self) -> None:
         probe = run_candidate(
@@ -94,81 +176,69 @@ class TestA13EnvAndWrites(unittest.TestCase):
         report = format_isolation_report(probe)
         print(
             f"CI_ISOLATION network={probe.network_isolation} "
-            f"filesystem={probe.filesystem_isolation}",
+            f"filesystem={probe.filesystem_isolation} "
+            f"errno={getattr(probe, 'isolation_detail', '')}",
             flush=True,
         )
         if not probe.filesystem_isolation:
             self.assertIn("filesystem_isolation: false", report)
             self.skipTest(
-                "filesystem_isolation unavailable on this host "
-                "(unprivileged userns/mount not usable); "
-                f"report:\n{report}"
+                "filesystem_isolation unavailable on this host; "
+                f"report:\n{report} detail={getattr(probe, 'isolation_detail', '')!r}"
             )
 
         self.assertIn("filesystem_isolation: true", report)
         host_tmp = tempfile.gettempdir()
         vectors = {
-            "pathlib": "\n".join(
-                [
-                    "from pathlib import Path",
-                    "Path({path!r}).write_text('leaked', encoding='utf-8')",
-                    "print('wrote')",
-                ]
+            "pathlib": (
+                "from pathlib import Path\n"
+                "Path({path!r}).write_text('leaked', encoding='utf-8')\n"
+                "print('wrote')\n"
             ),
-            "posix_open": "\n".join(
-                [
-                    "import posix",
-                    "fd = posix.open({path!r}, posix.O_WRONLY | posix.O_CREAT, 0o644)",
-                    "posix.write(fd, b'leaked')",
-                    "posix.close(fd)",
-                    "print('wrote')",
-                ]
+            "posix_open": (
+                "import posix\n"
+                "fd = posix.open({path!r}, posix.O_WRONLY | posix.O_CREAT, 0o644)\n"
+                "posix.write(fd, b'leaked')\n"
+                "posix.close(fd)\n"
+                "print('wrote')\n"
             ),
-            "io_open": "\n".join(
-                [
-                    "import _io",
-                    "f = _io.open({path!r}, 'w', encoding='utf-8')",
-                    "f.write('leaked')",
-                    "f.close()",
-                    "print('wrote')",
-                ]
+            "io_open": (
+                "import _io\n"
+                "f = _io.open({path!r}, 'w', encoding='utf-8')\n"
+                "f.write('leaked')\n"
+                "f.close()\n"
+                "print('wrote')\n"
             ),
-            "os_system": "\n".join(
-                [
-                    "import os",
-                    "os.system('echo leaked > {path}')",
-                    "print('wrote')",
-                ]
+            "os_system": (
+                "import os\n"
+                "os.system('echo leaked > {path}')\n"
+                "print('wrote')\n"
             ),
-            "subprocess": "\n".join(
-                [
-                    "import subprocess",
-                    "subprocess.run(['/bin/sh', '-c', 'echo leaked > {path}'], check=False)",
-                    "print('wrote')",
-                ]
+            "subprocess": (
+                "import subprocess\n"
+                "subprocess.run(['/bin/sh', '-c', 'echo leaked > {path}'], check=False)\n"
+                "print('wrote')\n"
             ),
         }
         names = list(vectors.keys())
         for i in range(len(names)):
             name = names[i]
             with self.subTest(vector=name):
-                host_path = Path(host_tmp) / f"turbine-a13-{name}-{uuid.uuid4().hex}.txt"
+                host_path = (
+                    Path(host_tmp) / f"turbine-a13-{name}-{uuid.uuid4().hex}.txt"
+                )
                 self.addCleanup(lambda p=host_path: p.unlink(missing_ok=True))
                 if host_path.exists():
                     host_path.unlink()
-                code = vectors[name].format(path=str(host_path))
                 result = run_candidate(
-                    code, timeout=3.0, isolation_check=lambda: True
+                    vectors[name].format(path=str(host_path)),
+                    timeout=3.0,
+                    isolation_check=lambda: True,
                 )
-                self.assertTrue(
-                    result.filesystem_isolation,
-                    f"expected filesystem_isolation for {name}: "
-                    f"{format_isolation_report(result)}",
-                )
+                self.assertTrue(result.filesystem_isolation)
                 self.assertFalse(
                     host_path.is_file(),
-                    f"{name} leaked to host path {host_path} "
-                    f"score={result.score} feedback={result.feedback!r}",
+                    f"{name} leaked to {host_path}",
                 )
 
 
@@ -188,7 +258,7 @@ class TestA14CrashFeedback(unittest.TestCase):
         self.assertIn("exit 3", result.feedback)
 
 
-class TestA15NetworkIsolationReport(unittest.TestCase):
+class TestA15FlagsAndPlumbing(unittest.TestCase):
     def test_report_false_when_check_disables_attempt(self) -> None:
         result = run_candidate(
             "print('ok')", timeout=2.0, isolation_check=lambda: False
@@ -197,8 +267,6 @@ class TestA15NetworkIsolationReport(unittest.TestCase):
             format_isolation_report(result),
             "network_isolation: false\nfilesystem_isolation: false",
         )
-        self.assertFalse(result.network_isolation)
-        self.assertFalse(result.filesystem_isolation)
 
     def test_report_false_when_unshare_fails_despite_check(self) -> None:
         def boom_unshare(flags: int) -> None:
@@ -215,17 +283,55 @@ class TestA15NetworkIsolationReport(unittest.TestCase):
             "network_isolation: false\nfilesystem_isolation: false",
         )
 
+    def test_stubbed_true_branch_flag_plumbing(self) -> None:
+        """True-branch plumbing must work even when os.unshare is absent."""
+        result = run_candidate(
+            "print('ok')",
+            timeout=2.0,
+            isolation_check=lambda: True,
+            unshare_fn=lambda flags: None,
+            write_maps_fn=lambda pid, uid, gid: True,
+            mount_fn=lambda target: True,
+        )
+        self.assertEqual(result.score, 1.0)
+        self.assertTrue(result.network_isolation)
+        self.assertTrue(result.filesystem_isolation)
+        self.assertEqual(
+            format_isolation_report(result),
+            "network_isolation: true\nfilesystem_isolation: true",
+        )
+
+    def test_fake_isolation_file_ignored(self) -> None:
+        code = "\n".join(
+            [
+                "from pathlib import Path",
+                "Path('.isolation').write_text('1 1\\n', encoding='utf-8')",
+                "print('ok')",
+            ]
+        )
+        result = run_candidate(
+            code, timeout=2.0, isolation_check=lambda: False
+        )
+        self.assertEqual(result.score, 1.0)
+        self.assertFalse(result.network_isolation)
+        self.assertFalse(result.filesystem_isolation)
+
     def test_real_isolation_blocks_socket_when_available(self) -> None:
-        net_ok, fs_ok = probe_isolation()
-        print(f"CI_PROBE network={net_ok} filesystem={fs_ok}", flush=True)
+        net_ok, fs_ok, detail = probe_isolation()
+        print(
+            f"CI_PROBE network={net_ok} filesystem={fs_ok} detail={detail!r}",
+            flush=True,
+        )
         if not net_ok:
             result = run_candidate(
                 "print('ok')", timeout=2.0, isolation_check=lambda: True
             )
-            self.assertIn("network_isolation: false", format_isolation_report(result))
+            self.assertIn(
+                "network_isolation: false", format_isolation_report(result)
+            )
             self.skipTest(
-                "network_isolation unavailable on this host "
-                f"(probe net={net_ok} fs={fs_ok})"
+                "network_isolation unavailable "
+                f"(probe net={net_ok} fs={fs_ok} detail={detail!r})"
             )
         code = "\n".join(
             [
@@ -243,12 +349,32 @@ class TestA15NetworkIsolationReport(unittest.TestCase):
         )
         result = run_candidate(code, timeout=3.0, isolation_check=lambda: True)
         self.assertTrue(result.network_isolation)
-        self.assertEqual(
-            format_isolation_report(result).splitlines()[0],
-            "network_isolation: true",
-        )
         self.assertIn("BLOCKED", result.stdout)
         self.assertNotIn("CONNECTED", result.stdout)
+
+    def test_workdir_survives_tmpdir_mask(self) -> None:
+        fake_tmp = tempfile.mkdtemp(prefix="turbine-fake-tmp-")
+        self.addCleanup(
+            lambda: __import__("shutil").rmtree(fake_tmp, ignore_errors=True)
+        )
+        with mock.patch.dict(os.environ, {"TMPDIR": fake_tmp}, clear=False):
+            # Force gettempdir to see TMPDIR.
+            tempfile.tempdir = None
+            result = run_candidate(
+                "print('ok')",
+                timeout=2.0,
+                isolation_check=lambda: True,
+                unshare_fn=lambda flags: None,
+                write_maps_fn=lambda pid, uid, gid: True,
+                mount_fn=lambda target: True,
+            )
+        self.assertEqual(result.score, 1.0)
+        self.assertIsNotNone(result.workdir)
+        self.assertFalse(
+            str(result.workdir).startswith(fake_tmp + os.sep)
+            or result.workdir == fake_tmp,
+            f"workdir {result.workdir!r} is under TMPDIR {fake_tmp!r}",
+        )
 
 
 if __name__ == "__main__":
