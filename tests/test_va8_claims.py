@@ -80,6 +80,8 @@ class TestClaims(unittest.TestCase):
         )
         self.assertEqual(run_cli(report)[0], 0)
         self.assertEqual(run_cli("Generated with [Claude Code](https://claude.com/claude-code)\n")[0], 0)
+        code, out = run_cli("Each claim needs `[seen: url]` on Turbine 3 [inferred].\n")
+        self.assertEqual(code, 0, out)
         code, out = run_cli("- [x] Environ scrub test passes (33 OK)\n")
         self.assertEqual(code, 1)
         self.assertIn("report.md:1:", out)

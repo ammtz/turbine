@@ -82,6 +82,7 @@ def check_line(text: str, n: int, read: PageReader, f: Findings) -> None:
     if not text:
         return
     for sentence in SENTENCE.split(text):
+        sentence = CODE.sub(" ", sentence)  # a tag quoted in `code` is text, not a tag
         tags = list(TAG.finditer(sentence))
         if not tags:
             if is_claim(sentence):
