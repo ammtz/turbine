@@ -14,7 +14,8 @@ or a capitalised word that doesn't open the sentence (a name); a question is nev
 claim. That is a heuristic: a
 false positive is fixed by tagging the sentence, never by loosening the rule. Lines in
 ``` fences, HTML markup, list and heading markers, `code spans` and unticked
-"- [ ]" items (plans) are not read as claims. A markdown link [text](url) is its own
+"- [ ]" items (plans) are not read as claims, nor are the house PR format's labels: headings,
+the issue-ID line and short "**Label:** value" fields. A markdown link [text](url) is its own
 citation, so its text is not either.
 
 An excerpt is matched against the page's text with markup removed and whitespace
@@ -43,6 +44,10 @@ NOT_NAMES = {"I", "A"}
 MARKUP = re.compile(r"<!--.*?-->|<[^>]+>")
 LEAD = re.compile(r"^\s*(?:#+\s+|>\s*|[-*+]\s+(?:\[[xX]\]\s+)?|\d+[.)]\s+)")
 PLAN = re.compile(r"^\s*[-*+]\s+\[ \]")
+# The house PR format: a heading, the issue-ID line ("PER-17") and short "**Label:** value" fields
+# (Door, Blast radius) label the description; they don't claim anything.
+NOT_PROSE = re.compile(r"^\s*(?:#{1,6}\s|[A-Z][A-Z0-9]*-\d+(?:[,\s]+[A-Z][A-Z0-9]*-\d+)*\s*$"
+                       r"|\*\*[^*]+:\*\*\s*(?:\S+(?:\s+\S+){0,2})?\s*$)")
 CODE = re.compile(r"`[^`]*`")
 LINK = re.compile(r"\[[^\]]*\]\([^)]*\)")
 
@@ -76,17 +81,17 @@ def is_claim(sentence: str) -> bool:
 
 
 def check_line(text: str, n: int, read: PageReader, f: Findings) -> None:
-    if PLAN.match(text):  # an unticked box is a plan, not a claim
+    if PLAN.match(text) or NOT_PROSE.match(text):  # a plan or a label, not a claim
         return
     text = LEAD.sub("", MARKUP.sub(" ", text)).strip()
     if not text:
         return
-    for sentence in SENTENCE.split(text):
-        sentence = CODE.sub(" ", sentence)  # a tag quoted in `code` is text, not a tag
+    for raw in SENTENCE.split(text):
+        sentence = CODE.sub(" ", raw)  # a tag quoted in `code` is text, not a tag
         tags = list(TAG.finditer(sentence))
         if not tags:
             if is_claim(sentence):
-                f.add(n, f"untagged claim: {sentence.strip()[:80]}")
+                f.add(n, f"untagged claim: {raw.strip()[:80]}")
             continue
         for t in tags:
             if t["seen"] and not URL.fullmatch(t["seen"]):

@@ -86,6 +86,12 @@ class TestClaims(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("report.md:1:", out)
 
+    def test_house_pr_format_labels_are_not_claims(self) -> None:
+        report = "PER-17\n\n## Merge Danger\n\n**Door:** two-way\n\n**Blast radius:** CI\n"
+        self.assertEqual(run_cli(report)[0], 0)
+        code, out = run_cli("**Blast radius:** CI breaks for 3 open PRs.\n")
+        self.assertEqual(code, 1, out)
+
     def test_excerpt_match_ignores_markup_and_spacing(self) -> None:
         f = claims.Findings()
         text = 'Logged [source: https://example.org/spec "Cache   reads are logged separately"].'
