@@ -9,25 +9,13 @@ import shutil
 import signal
 import sys
 import tempfile
-import textwrap
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-_ENV_ALLOW = frozenset(
-    {
-        "PATH",
-        "LANG",
-        "LC_ALL",
-        "LC_CTYPE",
-        "LC_MESSAGES",
-        "TERM",
-        "TZ",
-        "USER",
-        "LOGNAME",
-    }
-)
+# Only PATH/LANG are copied from the host; HOME is set to the workdir.
+_ENV_ALLOW = frozenset({"PATH", "LANG"})
 
 CLONE_NEWUSER = getattr(os, "CLONE_NEWUSER", 0x10000000)
 CLONE_NEWNS = getattr(os, "CLONE_NEWNS", 0x00020000)
@@ -39,39 +27,7 @@ PR_SET_DUMPABLE = 4
 PR_GET_DUMPABLE = 3
 PR_SET_CHILD_SUBREAPER = 36
 
-_HARNESS = textwrap.dedent(
-    r"""
-    import builtins, io, os, sys
-    from pathlib import Path
-    _CWD = Path.cwd().resolve()
-    _io_open = io.open
-    _os_open = os.open
-
-    def _inside(path):
-        try:
-            p = Path(path).resolve()
-        except Exception:
-            return False
-        return p == _CWD or _CWD in p.parents
-
-    def _guard_open(file, mode='r', *a, **k):
-        writing = any(c in str(mode) for c in 'wxa+')
-        if writing and not _inside(file):
-            raise PermissionError('outside sandbox cwd: %s' % (file,))
-        return _io_open(file, mode, *a, **k)
-
-    def os_open(path, flags, mode=0o777, *a, **k):
-        if flags & (os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_CREAT):
-            if not _inside(path):
-                raise PermissionError('outside sandbox cwd: %s' % (path,))
-        return _os_open(path, flags, mode, *a, **k)
-
-    builtins.open = _guard_open
-    io.open = _guard_open
-    os.open = os_open
-    # Candidate follows.
-    """
-)
+REFUSED_FEEDBACK = "refused: isolation unavailable"
 
 
 @dataclass
@@ -127,8 +83,6 @@ def format_isolation_line(result: SandboxResult) -> str:
 def _scrubbed_env(workdir: str) -> dict[str, str]:
     env = {k: v for k, v in os.environ.items() if k in _ENV_ALLOW}
     env["HOME"] = workdir
-    env["TMPDIR"] = workdir
-    env["PYTHONNOUSERSITE"] = "1"
     return env
 
 
@@ -152,11 +106,42 @@ def _workdir_root(host_tmpdir: str) -> str:
     return "/var/tmp"
 
 
-def _mount_tmpfs(target: str) -> bool:
+def _mount_private_and_tmpfs(target: str) -> bool:
+    """Make mounts private and overlay tmpfs on host tmp."""
     libc = _libc()
     if libc.mount(b"none", b"/", None, MS_REC | MS_PRIVATE, None) != 0:
         return False
     return libc.mount(b"tmpfs", target.encode(), b"tmpfs", 0, b"size=64m") == 0
+
+
+def _remount_proc() -> bool:
+    """Mount a procfs bound to the caller's PID namespace."""
+    libc = _libc()
+    return libc.mount(b"proc", b"/proc", b"proc", 0, None) == 0
+
+
+def _mount_tmpfs(target: str) -> bool:
+    """Full FS isolation when already inside the new PID namespace (probe path)."""
+    return _mount_private_and_tmpfs(target) and _remount_proc()
+
+
+def _apply_fs_isolation(target: str) -> bool:
+    """Tmpfs from the mount-ns holder; proc remount from a NEWPID child."""
+    if not _mount_private_and_tmpfs(target):
+        return False
+    # proc must be mounted by a process in the new PID namespace, otherwise
+    # /proc still exposes host PIDs (and mount may fail).
+    try:
+        mpid = os.fork()
+    except Exception:
+        return False
+    if mpid == 0:
+        os._exit(0 if _remount_proc() else 1)
+    try:
+        _, st = os.waitpid(mpid, 0)
+    except Exception:
+        return False
+    return os.WIFEXITED(st) and os.WEXITSTATUS(st) == 0
 
 
 def _write_id_maps(pid: int, uid: int, gid: int) -> bool:
@@ -291,7 +276,7 @@ def probe_isolation(
                 os.waitpid(pid2, 0)
                 os._exit(0)
             fs_ok = _mount_tmpfs(tmp)
-            os.write(out_w, f"1 {int(fs_ok)} ok\n".encode())
+            os.write(out_w, f"1 {int(fs_ok)} {'ok' if fs_ok else 'fs_mount'}\n".encode())
             os.close(out_w)
             os._exit(0)
         except OSError as exc:
@@ -388,8 +373,14 @@ def run_candidate(
     write_maps_fn: WriteMapsFn | None = None,
     mount_fn: MountFn | None = None,
     keep_workdir: bool = True,
+    allow_unisolated: bool = False,
 ) -> SandboxResult:
-    """Run candidate source in an isolated subprocess. Never raises to caller."""
+    """Run candidate source in an isolated subprocess. Never raises to caller.
+
+    Fail-closed: unless both network and filesystem isolation succeeded, the
+    candidate is not scored (feedback ``refused: isolation unavailable``)
+    unless ``allow_unisolated=True``.
+    """
     check = isolation_check or network_check or default_isolation_check
     try:
         attempt = bool(check())
@@ -408,7 +399,8 @@ def run_candidate(
     detail = ""
 
     try:
-        script.write_text(_HARNESS + "\n" + code + "\n", encoding="utf-8")
+        # No in-interpreter open() monkeypatch: it is not a security boundary.
+        script.write_text(code + "\n", encoding="utf-8")
         if os.name != "posix":
             return SandboxResult(
                 0.0, "sandbox requires POSIX", False, False, workdir=workdir
@@ -417,10 +409,20 @@ def run_candidate(
         ready_r, ready_w = os.pipe()
         go_r, go_w = os.pipe()
         flag_r, flag_w = os.pipe()
+        proceed_r, proceed_w = os.pipe()
         try:
             pid = os.fork()
         except Exception as exc:
-            for fd in (ready_r, ready_w, go_r, go_w, flag_r, flag_w):
+            for fd in (
+                ready_r,
+                ready_w,
+                go_r,
+                go_w,
+                flag_r,
+                flag_w,
+                proceed_r,
+                proceed_w,
+            ):
                 try:
                     os.close(fd)
                 except Exception:
@@ -433,6 +435,7 @@ def run_candidate(
             os.close(ready_r)
             os.close(go_w)
             os.close(flag_r)
+            os.close(proceed_w)
             try:
                 os.setsid()
             except Exception:
@@ -456,7 +459,6 @@ def run_candidate(
                     os.close(go_r)
                     if token == b"1":
                         got_net = True
-                        # Mount happens after the NEWPID fork (see below).
                     else:
                         child_detail = "maps_failed"
                 else:
@@ -479,8 +481,6 @@ def run_candidate(
                         pass
 
             # NEWPID: fork before mount (mount-then-fork hits ENOMEM on some kernels).
-            # Mount in the intermediate so the shared mount ns is ready, then release
-            # the candidate (PID 1) to exec.
             hold_r, hold_w = os.pipe()
             try:
                 pid1 = os.fork()
@@ -491,12 +491,12 @@ def run_candidate(
                 # Candidate's ppid is this intermediate process; scrub dumpable
                 # before it can read /proc/<ppid>/environ.
                 _prctl_dumpable(0)
-                # Orphans of the candidate reparent here instead of init, so we
-                # can reap them without killing recycled host PIDs.
                 _prctl_child_subreaper(1)
                 if child_detail == "ok" and got_net:
-                    mounter = mount_fn or _mount_tmpfs
+                    mounter = mount_fn or _apply_fs_isolation
                     got_fs = bool(mounter(host_tmpdir))
+                    if not got_fs and child_detail == "ok":
+                        child_detail = "fs_mount"
                 try:
                     os.write(
                         flag_w,
@@ -508,6 +508,30 @@ def run_candidate(
                         os.close(flag_w)
                     except Exception:
                         pass
+                # Wait for parent fail-closed decision before releasing candidate.
+                try:
+                    proceed = os.read(proceed_r, 1)
+                except Exception:
+                    proceed = b"0"
+                try:
+                    os.close(proceed_r)
+                except Exception:
+                    pass
+                if proceed != b"1":
+                    try:
+                        os.kill(pid1, signal.SIGKILL)
+                    except Exception:
+                        pass
+                    try:
+                        os.write(hold_w, b"0")
+                        os.close(hold_w)
+                    except Exception:
+                        pass
+                    try:
+                        os.waitpid(pid1, 0)
+                    except Exception:
+                        pass
+                    os._exit(0)
                 try:
                     os.write(hold_w, b"1")
                     os.close(hold_w)
@@ -517,7 +541,6 @@ def run_candidate(
                     _, st = os.waitpid(pid1, 0)
                 except Exception:
                     os._exit(1)
-                # Reap any children reparented to us as subreaper.
                 for _ in range(32):
                     orphans = _collect_descendants(os.getpid(), limit=256)
                     if not orphans:
@@ -550,13 +573,19 @@ def run_candidate(
             except Exception:
                 pass
             try:
-                os.read(hold_r, 1)
+                os.close(proceed_r)
             except Exception:
                 pass
+            try:
+                token = os.read(hold_r, 1)
+            except Exception:
+                token = b"0"
             try:
                 os.close(hold_r)
             except Exception:
                 pass
+            if token != b"1":
+                os._exit(0)
             try:
                 _exec_candidate(
                     workdir,
@@ -580,13 +609,12 @@ def run_candidate(
         os.close(ready_w)
         os.close(go_r)
         os.close(flag_w)
+        os.close(proceed_r)
         maps = write_maps_fn or _write_id_maps
         try:
             if attempt:
                 ready = os.read(ready_r, 1)
                 # uid_map writes require this process to remain dumpable.
-                # Environ scrub for the candidate is done in the intermediate
-                # (pid1 != 0) before the candidate runs.
                 mapped = ready == b"1" and maps(pid, os.getuid(), os.getgid())
                 if mapped:
                     os.write(go_w, b"1")
@@ -624,6 +652,48 @@ def run_candidate(
             except Exception:
                 pass
 
+        isolated = net_flag and fs_flag
+        if not isolated and not allow_unisolated:
+            try:
+                os.write(proceed_w, b"0")
+            except Exception:
+                pass
+            try:
+                os.close(proceed_w)
+            except Exception:
+                pass
+            _reap_tree(pid)
+            for _ in range(32):
+                try:
+                    wpid, _ = os.waitpid(-1, os.WNOHANG)
+                except ChildProcessError:
+                    break
+                if wpid == 0:
+                    break
+            try:
+                os.waitpid(pid, 0)
+            except Exception:
+                pass
+            return SandboxResult(
+                score=0.0,
+                feedback=REFUSED_FEEDBACK,
+                network_isolation=net_flag,
+                filesystem_isolation=fs_flag,
+                stdout="",
+                stderr="",
+                workdir=workdir,
+                isolation_detail=detail or "unisolated",
+            )
+
+        try:
+            os.write(proceed_w, b"1")
+        except Exception:
+            pass
+        try:
+            os.close(proceed_w)
+        except Exception:
+            pass
+
         timed_out = False
         exited = False
         status = 0
@@ -643,8 +713,6 @@ def run_candidate(
                 break
             time.sleep(0.02)
 
-        # Kill the sandbox leader/group; subreaper then lets us reap orphans
-        # that were live children of this process (no stale-PID kill list).
         _reap_tree(pid)
         for _ in range(32):
             orphans = [

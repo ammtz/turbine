@@ -57,6 +57,7 @@ Status: draft for build. v0 exists in this folder and is the starting point. It 
 ### 6.3 Scorer isolation
 - Candidate code runs in a subprocess: isolated interpreter flags, temp cwd, scrubbed env (no keys, no tokens), CPU, memory and file-size rlimits, wall timeout.
 - Network is denied where the OS allows it. Where it can't be enforced, the result says `network_isolation: false` and the run report prints that line.
+- If network or filesystem isolation cannot both be enforced, `run_candidate` refuses to score (`refused: isolation unavailable`) unless the caller passes `allow_unisolated=True`; an in-process `open()` monkeypatch is not a security boundary.
 - A scorer that times out or crashes returns score 0 with the reason in the feedback. It never raises into the loop.
 
 ### 6.4 Judge scorers (optional)

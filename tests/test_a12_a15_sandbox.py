@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -13,6 +14,7 @@ from pathlib import Path
 from unittest import mock
 
 from turbine.sandbox import (
+    REFUSED_FEEDBACK,
     format_isolation_report,
     probe_isolation,
     run_candidate,
@@ -57,6 +59,7 @@ class TestA12TimeoutAndReap(unittest.TestCase):
             timeout=1.0,
             memory_bytes=1024 * 1024 * 1024,
             isolation_check=lambda: False,
+            allow_unisolated=True,
         )
         elapsed = time.monotonic() - t0
         self.assertEqual(result.score, 0.0)
@@ -83,7 +86,10 @@ class TestA12TimeoutAndReap(unittest.TestCase):
             ]
         )
         result = run_candidate(
-            code, timeout=3.0, isolation_check=lambda: False
+            code,
+            timeout=3.0,
+            isolation_check=lambda: False,
+            allow_unisolated=True,
         )
         self.assertEqual(result.score, 1.0)
         child_file = Path(result.workdir) / "childpid"
@@ -113,6 +119,7 @@ class TestA12TimeoutAndReap(unittest.TestCase):
             timeout=1.0,
             memory_bytes=1024 * 1024 * 1024,
             isolation_check=lambda: False,
+            allow_unisolated=True,
         )
         self.assertEqual(result.score, 0.0)
         self.assertIn("timeout", result.feedback.lower())
@@ -142,7 +149,12 @@ class TestA13EnvAndWrites(unittest.TestCase):
         ):
             self.assertEqual(os.environ.get("TURBINE_TEST_API_KEY"), "sk-test")
             self.assertEqual(os.environ.get("OPENAI_API_KEY"), "sk-test-openai")
-            result = run_candidate(code, timeout=2.0, isolation_check=lambda: False)
+            result = run_candidate(
+                code,
+                timeout=2.0,
+                isolation_check=lambda: False,
+                allow_unisolated=True,
+            )
         self.assertNotIn("TURBINE_TEST_API_KEY", result.stdout)
         self.assertNotIn("OPENAI_API_KEY", result.stdout)
         self.assertNotIn("sk-test", result.stdout)
@@ -173,7 +185,11 @@ class TestA13EnvAndWrites(unittest.TestCase):
                 "    \"        chunks.append(f'ERR:{type(e).__name__}')\",",
                 "    \"print('---'.join(chunks))\",",
                 "])",
-                "r = run_candidate(code, timeout=2.0, isolation_check=lambda: False)",
+                "r = run_candidate(",
+                "    code, timeout=2.0,",
+                "    isolation_check=lambda: False,",
+                "    allow_unisolated=True,",
+                ")",
                 "sys.stdout.write(r.stdout)",
                 "sys.exit(0 if r.score == 1.0 else 1)",
             ]
@@ -207,6 +223,8 @@ class TestA13EnvAndWrites(unittest.TestCase):
             flush=True,
         )
         if not probe.filesystem_isolation:
+            self.assertEqual(probe.score, 0.0)
+            self.assertEqual(probe.feedback, REFUSED_FEEDBACK)
             self.assertIn("filesystem_isolation: false", report)
             self.skipTest(
                 "filesystem_isolation unavailable on this host; "
@@ -271,14 +289,20 @@ class TestA13EnvAndWrites(unittest.TestCase):
 class TestA14CrashFeedback(unittest.TestCase):
     def test_raise_value_error(self) -> None:
         result = run_candidate(
-            "raise ValueError('boom')", timeout=2.0, isolation_check=lambda: False
+            "raise ValueError('boom')",
+            timeout=2.0,
+            isolation_check=lambda: False,
+            allow_unisolated=True,
         )
         self.assertEqual(result.score, 0.0)
         self.assertIn("boom", result.feedback)
 
     def test_sys_exit_nonzero(self) -> None:
         result = run_candidate(
-            "import sys; sys.exit(3)", timeout=2.0, isolation_check=lambda: False
+            "import sys; sys.exit(3)",
+            timeout=2.0,
+            isolation_check=lambda: False,
+            allow_unisolated=True,
         )
         self.assertEqual(result.score, 0.0)
         self.assertIn("exit 3", result.feedback)
@@ -287,7 +311,10 @@ class TestA14CrashFeedback(unittest.TestCase):
 class TestA15FlagsAndPlumbing(unittest.TestCase):
     def test_report_false_when_check_disables_attempt(self) -> None:
         result = run_candidate(
-            "print('ok')", timeout=2.0, isolation_check=lambda: False
+            "print('ok')",
+            timeout=2.0,
+            isolation_check=lambda: False,
+            allow_unisolated=True,
         )
         self.assertEqual(
             format_isolation_report(result),
@@ -305,6 +332,7 @@ class TestA15FlagsAndPlumbing(unittest.TestCase):
             timeout=2.0,
             isolation_check=lambda: True,
             unshare_fn=boom_unshare,
+            allow_unisolated=True,
         )
         self.assertEqual(
             format_isolation_report(result),
@@ -338,7 +366,10 @@ class TestA15FlagsAndPlumbing(unittest.TestCase):
             ]
         )
         result = run_candidate(
-            code, timeout=2.0, isolation_check=lambda: False
+            code,
+            timeout=2.0,
+            isolation_check=lambda: False,
+            allow_unisolated=True,
         )
         self.assertEqual(result.score, 1.0)
         self.assertFalse(result.network_isolation)
@@ -352,7 +383,10 @@ class TestA15FlagsAndPlumbing(unittest.TestCase):
         )
         if not net_ok:
             result = run_candidate(
-                "print('ok')", timeout=2.0, isolation_check=lambda: True
+                "print('ok')",
+                timeout=2.0,
+                isolation_check=lambda: True,
+                allow_unisolated=True,
             )
             self.assertIn(
                 "network_isolation: false", format_isolation_report(result)
@@ -375,7 +409,13 @@ class TestA15FlagsAndPlumbing(unittest.TestCase):
                 "    s.close()",
             ]
         )
-        result = run_candidate(code, timeout=3.0, isolation_check=lambda: True)
+        # Opt in so network blocking is still tested when tmpfs/proc is unavailable.
+        result = run_candidate(
+            code,
+            timeout=3.0,
+            isolation_check=lambda: True,
+            allow_unisolated=True,
+        )
         self.assertTrue(result.network_isolation)
         self.assertEqual(
             format_isolation_report(result).splitlines()[0],
@@ -410,6 +450,186 @@ class TestA15FlagsAndPlumbing(unittest.TestCase):
             str(result.workdir).startswith(fake_tmp + os.sep)
             or result.workdir == fake_tmp,
             f"workdir {result.workdir!r} is under TMPDIR {fake_tmp!r}",
+        )
+
+
+class TestFailClosedIsolation(unittest.TestCase):
+    def test_refuse_when_filesystem_isolation_false(self) -> None:
+        result = run_candidate(
+            "print('SHOULD_NOT_RUN')",
+            timeout=2.0,
+            isolation_check=lambda: True,
+            unshare_fn=lambda flags: None,
+            write_maps_fn=lambda pid, uid, gid: True,
+            mount_fn=lambda target: False,
+        )
+        self.assertEqual(result.score, 0.0)
+        self.assertEqual(result.feedback, REFUSED_FEEDBACK)
+        self.assertTrue(result.network_isolation)
+        self.assertFalse(result.filesystem_isolation)
+        self.assertNotIn("SHOULD_NOT_RUN", result.stdout)
+
+    def test_refuse_when_isolation_disabled(self) -> None:
+        result = run_candidate(
+            "print('SHOULD_NOT_RUN')",
+            timeout=2.0,
+            isolation_check=lambda: False,
+        )
+        self.assertEqual(result.score, 0.0)
+        self.assertEqual(result.feedback, REFUSED_FEEDBACK)
+        self.assertFalse(result.network_isolation)
+        self.assertFalse(result.filesystem_isolation)
+        self.assertNotIn("SHOULD_NOT_RUN", result.stdout)
+
+    def test_allow_unisolated_empty_env_and_home(self) -> None:
+        marker = f"sk-allow-{uuid.uuid4().hex}"
+        code = "\n".join(
+            [
+                "import os, json",
+                "print(json.dumps({",
+                "    'keys': sorted(os.environ.keys()),",
+                "    'home': os.environ.get('HOME'),",
+                "    'cwd': os.getcwd(),",
+                "}))",
+            ]
+        )
+        with mock.patch.dict(
+            os.environ,
+            {
+                "TURBINE_TEST_API_KEY": marker,
+                "OPENAI_API_KEY": marker + "-oai",
+                "USER": "should-not-leak",
+                "TERM": "xterm-leak",
+            },
+            clear=False,
+        ):
+            result = run_candidate(
+                code,
+                timeout=2.0,
+                isolation_check=lambda: False,
+                allow_unisolated=True,
+            )
+        self.assertEqual(result.score, 1.0)
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(payload["home"], result.workdir)
+        allowed = {"PATH", "LANG", "HOME"}
+        self.assertTrue(set(payload["keys"]).issubset(allowed))
+        self.assertIn("HOME", payload["keys"])
+        self.assertNotIn("TURBINE_TEST_API_KEY", payload["keys"])
+        self.assertNotIn("OPENAI_API_KEY", payload["keys"])
+        self.assertNotIn("USER", payload["keys"])
+        self.assertNotIn("TERM", payload["keys"])
+        self.assertNotIn(marker, result.stdout)
+
+    def test_isolated_hides_host_proc_environ(self) -> None:
+        """Port of red-team /proc environ: host PIDs must not leak secrets."""
+        marker = f"synthetic-{uuid.uuid4().hex}"
+        fixture = subprocess.Popen(
+            [sys.executable, "-I", "-c", "import time; time.sleep(8)"],
+            env={"REDTEAM_SECRET": marker},
+        )
+        self.addCleanup(fixture.wait, 2)
+        self.addCleanup(fixture.kill)
+        code = "\n".join(
+            [
+                "import json, os",
+                f"host_pid = {fixture.pid}",
+                f"host_ppid = {os.getpid()}",
+                "paths = [",
+                "    '/proc/1/environ',",
+                "    f'/proc/{os.getppid()}/environ',",
+                "    f'/proc/{host_ppid}/environ',",
+                "    f'/proc/{host_pid}/environ',",
+                "]",
+                "found = {}",
+                "for path in paths:",
+                "    try:",
+                "        data = open(path, 'rb').read()",
+                f"        found[path] = {{'exists': True, 'readable': True,",
+                f"                       'synthetic_secret': {marker!r}.encode() in data}}",
+                "    except FileNotFoundError:",
+                "        found[path] = {'exists': False, 'readable': False,",
+                "                       'synthetic_secret': False}",
+                "    except OSError:",
+                "        found[path] = {'exists': os.path.exists(path), 'readable': False,",
+                "                       'synthetic_secret': False}",
+                "print('ATTEMPTED')",
+                "print(json.dumps({",
+                "    'found': found,",
+                "    'fixture_dir': os.path.exists(f'/proc/{host_pid}'),",
+                "    'caller_dir': os.path.exists(f'/proc/{host_ppid}'),",
+                "}))",
+            ]
+        )
+        result = run_candidate(code, timeout=3.0, isolation_check=lambda: True)
+        if not (result.network_isolation and result.filesystem_isolation):
+            self.assertEqual(result.score, 0.0)
+            self.assertEqual(result.feedback, REFUSED_FEEDBACK)
+            self.assertNotIn("ATTEMPTED", result.stdout)
+            self.skipTest(
+                "full isolation unavailable; fail-closed refused "
+                f"net={result.network_isolation} fs={result.filesystem_isolation}"
+            )
+        self.assertEqual(result.score, 1.0)
+        self.assertIn("ATTEMPTED", result.stdout)
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        observations = payload["found"]
+        self.assertFalse(
+            any(v["synthetic_secret"] for v in observations.values()),
+            f"synthetic host secret read: {observations}",
+        )
+        # Proc remount must hide host PIDs (not merely make environ unreadable).
+        self.assertFalse(
+            payload["fixture_dir"],
+            f"host fixture PID still visible in /proc: {payload}",
+        )
+        self.assertFalse(
+            payload["caller_dir"],
+            f"host caller PID still visible in /proc: {payload}",
+        )
+
+    def test_isolated_posix_open_tmp_escape(self) -> None:
+        """Port of red-team posix.open escape; no open() monkeypatch reliance."""
+        host_tmp = tempfile.gettempdir()
+        host_path = Path(host_tmp) / f"turbine-posix-{uuid.uuid4().hex}.txt"
+        self.addCleanup(lambda: host_path.unlink(missing_ok=True))
+        if host_path.exists():
+            host_path.unlink()
+        code = "\n".join(
+            [
+                "import posix",
+                f"path = {str(host_path)!r}",
+                "try:",
+                "    open(path, 'w').write('synthetic')",
+                "    print('OPEN_OK')",
+                "except PermissionError:",
+                "    print('OPEN_BLOCKED')",
+                "try:",
+                "    fd = posix.open(path, posix.O_WRONLY | posix.O_CREAT, 0o600)",
+                "    posix.write(fd, b'synthetic')",
+                "    posix.close(fd)",
+                "    print('POSIX_OK')",
+                "except OSError as e:",
+                "    print('POSIX_ERR', type(e).__name__)",
+                "print('ATTEMPTED')",
+            ]
+        )
+        result = run_candidate(code, timeout=3.0, isolation_check=lambda: True)
+        if not (result.network_isolation and result.filesystem_isolation):
+            self.assertEqual(result.score, 0.0)
+            self.assertEqual(result.feedback, REFUSED_FEEDBACK)
+            self.assertNotIn("ATTEMPTED", result.stdout)
+            self.skipTest(
+                "full isolation unavailable; fail-closed refused "
+                f"net={result.network_isolation} fs={result.filesystem_isolation}"
+            )
+        self.assertEqual(result.score, 1.0)
+        # Harness must not be present: open() reaches the kernel (tmpfs).
+        self.assertIn("OPEN_OK", result.stdout)
+        self.assertNotIn("OPEN_BLOCKED", result.stdout)
+        self.assertIn("POSIX_OK", result.stdout)
+        self.assertFalse(
+            host_path.is_file(), f"posix.open escaped to host {host_path}"
         )
 
 
