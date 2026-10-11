@@ -12,5 +12,14 @@ python -m unittest discover -s tests -v
 
 Requires Python 3.11+. Standard library only.
 
+## Checking a report's claims (VA8)
+
+```bash
+python -m turbine.claims REPORT.md [--pages PAGES.json] [--fetch]
+```
+
+Every factual sentence in a worker's report carries `[seen: URL]`, `[source: URL "excerpt"]` or
+`[inferred]`. Exit 1 lists each untagged claim and each excerpt not found on its page.
+
 License: MIT
 
