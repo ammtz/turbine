@@ -13,7 +13,9 @@ A sentence is a factual claim when, with tags and bare URLs taken out, it holds 
 or a capitalised word that doesn't open the sentence (a name); a question is never a
 claim. That is a heuristic: a
 false positive is fixed by tagging the sentence, never by loosening the rule. Lines in
-``` fences are skipped.
+``` fences, HTML markup, list and heading markers, `code spans` and unticked
+"- [ ]" items (plans) are not read as claims. A markdown link [text](url) is its own
+citation, so its text is not either.
 
 An excerpt is matched against the page's text with markup removed and whitespace
 collapsed; case and wording must match. Pages come from --pages (a JSON object, URL to
@@ -38,6 +40,11 @@ URL = re.compile(r"https?://\S+")
 SENTENCE = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\[(\"'])")
 NAME = re.compile(r"\b[A-Z][A-Za-z0-9_-]*\b")
 NOT_NAMES = {"I", "A"}
+MARKUP = re.compile(r"<!--.*?-->|<[^>]+>")
+LEAD = re.compile(r"^\s*(?:#+\s+|>\s*|[-*+]\s+(?:\[[xX]\]\s+)?|\d+[.)]\s+)")
+PLAN = re.compile(r"^\s*[-*+]\s+\[ \]")
+CODE = re.compile(r"`[^`]*`")
+LINK = re.compile(r"\[[^\]]*\]\([^)]*\)")
 
 PageReader = Callable[[str], Optional[str]]
 
@@ -57,7 +64,7 @@ def plain(text: str) -> str:
 
 
 def is_claim(sentence: str) -> bool:
-    bare = URL.sub(" ", TAG.sub(" ", sentence)).strip()
+    bare = CODE.sub(" ", URL.sub(" ", LINK.sub(" ", TAG.sub(" ", sentence)))).strip()
     if bare.endswith("?"):  # a question asks; it doesn't claim
         return False
     if re.search(r"\d", bare):
@@ -69,7 +76,12 @@ def is_claim(sentence: str) -> bool:
 
 
 def check_line(text: str, n: int, read: PageReader, f: Findings) -> None:
-    for sentence in SENTENCE.split(text.strip()):
+    if PLAN.match(text):  # an unticked box is a plan, not a claim
+        return
+    text = LEAD.sub("", MARKUP.sub(" ", text)).strip()
+    if not text:
+        return
+    for sentence in SENTENCE.split(text):
         tags = list(TAG.finditer(sentence))
         if not tags:
             if is_claim(sentence):

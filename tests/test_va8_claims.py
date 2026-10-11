@@ -71,6 +71,19 @@ class TestClaims(unittest.TestCase):
         report = "```\nx = 42\nFooBar()\n```\nsee https://example.org/a1b2\n"
         self.assertEqual(run_cli(report)[0], 0)
 
+    def test_markdown_and_html_are_not_prose(self) -> None:
+        report = (
+            "<!-- BODY_BEGIN -->\n## Summary\n"
+            "- [x] Tests pass [seen: https://github.com/x/y/actions/runs/1].\n"
+            "- [ ] CI green on `m3-branch`\n"
+            '<div><a href="https://x.com/a"><img alt="Open in Web" width="114"></a></div>\n'
+        )
+        self.assertEqual(run_cli(report)[0], 0)
+        self.assertEqual(run_cli("Generated with [Claude Code](https://claude.com/claude-code)\n")[0], 0)
+        code, out = run_cli("- [x] Environ scrub test passes (33 OK)\n")
+        self.assertEqual(code, 1)
+        self.assertIn("report.md:1:", out)
+
     def test_excerpt_match_ignores_markup_and_spacing(self) -> None:
         f = claims.Findings()
         text = 'Logged [source: https://example.org/spec "Cache   reads are logged separately"].'
