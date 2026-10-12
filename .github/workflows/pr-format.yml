@@ -1,0 +1,34 @@
+name: PR format
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  pr-format:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Check PR title, branch and body
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+          BRANCH: ${{ github.event.pull_request.head.ref }}
+          BODY: ${{ github.event.pull_request.body }}
+        run: |
+          fail=0
+          miss() { echo "::error::$1"; fail=1; }
+          printf '%s\n%s\n' "$TITLE" "$BRANCH" | grep -Eq 'PER-[0-9]+' || miss "Title or branch needs a Linear ID like PER-12."
+          for h in '## Summary' '## Evidence' '## Merge Danger'; do
+            printf '%s' "$BODY" | grep -Fq "$h" || miss "Body is missing '$h'."
+          done
+          printf '%s' "$BODY" | grep -Eiq '\*\*Door:\*\*[[:space:]]*(one|two)-way' || miss "Set **Door:** to one-way or two-way."
+          printf '%s' "$BODY" | grep -Eiq '\*\*Blast radius:\*\*[[:space:]]*[[:alnum:]]' || miss "Fill **Blast radius:** with one word."
+          printf '%s' "$BODY" | grep -Eiq '\*\*Needs your decision:\*\*[[:space:]]*[[:alnum:]]' || miss "Fill **Needs your decision:** (none, or one question)."
+          if [ "$fail" -ne 0 ]; then
+            echo "Template: .github/pull_request_template.md"
+            exit 1
+          fi
+          echo "PR format OK."
