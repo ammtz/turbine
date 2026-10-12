@@ -12,5 +12,7 @@ python -m unittest discover -s tests -v
 
 Requires Python 3.11+. Standard library only.
 
+Scorer isolation is fail-closed: without both network and filesystem isolation, `run_candidate` refuses to score unless `allow_unisolated=True`.
+
 License: MIT
 
