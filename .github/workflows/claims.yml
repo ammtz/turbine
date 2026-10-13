@@ -1,0 +1,25 @@
+name: claims
+
+# VA8: every factual claim in a pull request's description carries its evidence tag
+# ([seen: url], [source: url "excerpt"] or [inferred]). Runs again when the description is edited.
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  claims:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Check the PR description
+        env:
+          BODY: ${{ github.event.pull_request.body }}
+        run: |
+          printf '%s\n' "$BODY" > "$RUNNER_TEMP/pr-body.md"
+          python -m turbine.claims "$RUNNER_TEMP/pr-body.md" --fetch
