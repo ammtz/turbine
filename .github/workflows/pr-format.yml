@@ -20,7 +20,7 @@ jobs:
         run: |
           fail=0
           miss() { echo "::error::$1"; fail=1; }
-          printf '%s\n%s\n' "$TITLE" "$BRANCH" | grep -Eq 'PER-[0-9]+' || miss "Title or branch needs a Linear ID like PER-12."
+          printf '%s\n%s\n' "$TITLE" "$BRANCH" | grep -Eiq '(^|[^[:alnum:]])PER-[0-9]+' || miss "Title or branch needs a Linear ID like PER-12."
           for h in '## Summary' '## Evidence' '## Merge Danger'; do
             printf '%s' "$BODY" | grep -Fq "$h" || miss "Body is missing '$h'."
           done
